@@ -1,7 +1,7 @@
 cbloader
 =======
 
-Yet another load generating tool for use while testing the behaviour and performance of memchaced.
+Yet another load generating tool for use while testing the behaviour and performance of memcached. Currently very basic
 
 Dependencies
 ============
@@ -23,6 +23,9 @@ Usage
     $ cbloader
     $ cbloader -n 10k -p 1kb -s 127.0.0.1:12001 -kg rand
     $ cbloader --num-keys 10k --payload-size 1kb --servers 127.0.0.1:120001 --key-gen rand
+
+### Arguments
+
         -n / --num_keys X
     The number of keys to write to memcached eg: 1, 100, 50k, 3m
 
