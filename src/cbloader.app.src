@@ -1,0 +1,12 @@
+{application, cbloader,
+ [
+  {description, ""},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, { cbloader_app, []}},
+  {env, []}
+ ]}.
