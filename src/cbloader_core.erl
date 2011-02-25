@@ -2,7 +2,10 @@
 -export([dispatch/1]).
 
 -define(SHELL_WIDTH, 50).
--define(SHELL_UPDATE, 500).
+-define(SHELL_REFRESH, 500).
+-define(STATS_UPDATE, 500).
+
+-define(TCP_TIMEOUT, 5000).
 -define(TCP_OPTS, [binary, {packet, line}, {active, false}]).
 
 %% Main entry point
@@ -14,10 +17,8 @@ dispatch(Conf) ->
     Servers = pget(servers, Conf),
     KeySize = pget(payload_size, Conf),
     NumKeys = pget(num_keys, Conf),
-
-    log("Posting ~p keys of ~p bytes to each server:~n~n", [NumKeys, KeySize]),
     {Time, ok} = timer:tc(fun start/4, [Self, Servers, KeySize, NumKeys]),
-    log("~nCompleted in ~.2f seconds~n", [Time/1000/1000]).
+    log("~n\e[32mCompleted in ~.2f seconds\e[0m~n", [Time/1000/1000]).
 
 
 %% @doc Spin off a thread for each tcp connection and start writing data
@@ -28,8 +29,11 @@ start(Self, Servers, KeySize, NumKeys) ->
     Value = gen_bin(KeySize),
 
     {ok, Connections} = open_conn(Servers),
-    {ok, DisplayTimer} = timer:send_interval(?SHELL_UPDATE, Self, print),
-    {ok, StatsTimer} = timer:send_interval(?SHELL_UPDATE, Self, stats),
+
+    log("~nKeys: ~p ~nPacket Size: ~p~n~n", [NumKeys, KeySize]),
+
+    {ok, DisplayTimer} = timer:send_interval(?SHELL_REFRESH, Self, print),
+    {ok, StatsTimer} = timer:send_interval(?STATS_UPDATE, Self, stats),
 
     [{SHost, SIP}|_Rest] = Servers,
     {ok, SSock} = gen_tcp:connect(SHost, SIP, ?TCP_OPTS),
@@ -37,7 +41,7 @@ start(Self, Servers, KeySize, NumKeys) ->
     Workers = spawn_workers(Connections, Self, Value, NumKeys),
     Dict = dict:from_list([{Sock, {Host, IP, 0}} || {Host, IP, Sock} <- Workers]),
 
-    wait(Dict, NumKeys, fetch_stats(SSock), SSock, length(Servers)),
+    wait(Dict, NumKeys, fetch_stats(SSock), SSock, length(Servers), dict:new()),
 
     {ok, cancel} = timer:cancel(StatsTimer),
     {ok, cancel} = timer:cancel(DisplayTimer),
@@ -47,26 +51,30 @@ start(Self, Servers, KeySize, NumKeys) ->
 %% @doc Part of the main process, sits and waits for the other processes to
 %% finish writing to memcache, fetches stats and updates ui in the meanwhile,
 %% bit messy
-wait(Workers, Total, Stats, Sock, NumServers) ->
+wait(Workers, Total, Stats, Sock, NumServers, Errs) ->
     receive
         stats ->
             NStats = fetch_stats(Sock),
-            wait(Workers, Total, NStats, Sock, NumServers);
+            wait(Workers, Total, NStats, Sock, NumServers, Errs);
         print ->
-            output(Workers, Total, Stats, false),
-            wait(Workers, Total, Stats, Sock, NumServers);
+            output(Workers, Total, Stats, Errs, false),
+            wait(Workers, Total, Stats, Sock, NumServers, Errs);
+        {error, Err} ->
+            NErrs = dict:update_counter(format_err(Err), 1, Errs),
+            wait(Workers, Total, Stats, Sock, NumServers, NErrs);
         {left, Pid, N} ->
             Fun = fun({Host, IP, _}) -> {Host, IP, N} end,
-            wait(dict:update(Pid, Fun, Workers), Total, Stats, Sock, NumServers);
+            NDict = dict:update(Pid, Fun, Workers),
+            wait(NDict, Total, Stats, Sock, NumServers, Errs);
         {complete, _Pid} ->
             % Let my message queue flush
             case NumServers =:= 1 of
                 true -> self() ! done;
                 _    -> ok
             end,
-            wait(Workers, Total, Stats, Sock, NumServers-1);
+            wait(Workers, Total, Stats, Sock, NumServers - 1, Errs);
         done ->
-            output(Workers, Total, Stats, true)
+            output(Workers, Total, Stats, Errs, true)
     end.
 
 %% @doc format the currest status of individual server writes
@@ -85,15 +93,23 @@ pbar(Perc) ->
 
 
 %% @doc Displays the current status in the shell
-output(Workers, Total, Stats, LastLine) ->
+output(Workers, Total, Stats, Errs, LastLine) ->
+
+    ErrOut = [ fmt("  \e[31m~s(~p)\e[0m~n", [ErrLabel, Count])
+               || {ErrLabel, Count} <- dict:to_list(Errs) ],
 
     Work = [ write_status(Total, Left, Host, IP)
              || {_Pid, {Host, IP, Left}} <- dict:to_list(Workers) ],
 
-    StatOut = stat(Stats, []),
-    BackLog = length(Work) + length(StatOut) + 1,
+    NErrors = case ErrOut of
+                  [] -> [];
+                  _ -> [fmt("Errors:~n", []) | ErrOut]
+              end,
 
-    log([Work, StatOut]),
+    StatOut = stat(Stats, []),
+    BackLog = length(NErrors) + length(Work) + length(StatOut) + 1,
+
+    log([Work, StatOut, NErrors]),
 
     % Set the cursor back to where I started writing
     % to do in place updates (unless its the last line)
@@ -107,14 +123,24 @@ cb_write(_Socks, Main, _Val, 0) ->
     Main ! {complete, self()},
     ok;
 
-cb_write(Sock, Self, Val, N) ->
-    %Cmd = fmt("set ~s ~p 0 ~p\r\n", [gen_key(), byte_size(Val) ]),
+cb_write(Sock, Main, Val, N) ->
     ok = gen_tcp:send(Sock, cmd(gen_key(), byte_size(Val))),
     ok = gen_tcp:send(Sock, [Val, <<"\r\n">>]),
-    {ok, <<"STORED\r\n">>} = gen_tcp:recv(Sock, 0, 500),
-    Self ! {left, self(), N},
-    cb_write(Sock, Self, Val, N-1).
+    % Need to change to passive mode pretty quickly, hard to tell the difference
+    % between timeouts and sending memcached the wrong Content-Length
+    {ok, Data} = gen_tcp:recv(Sock, 0, ?TCP_TIMEOUT),
+    ok = report_errors(Data, Main),
+    Main ! {left, self(), N},
+    cb_write(Sock, Main, Val, N-1).
 
+
+%% @doc If memcached returns anything other than the expected stored
+%% command, report back to main thread
+report_errors(<<"STORED\r\n">>, _Main) ->
+    ok;
+report_errors(Err, Main) ->
+    Main ! {error, Err},
+    ok.
 
 %% @doc spawn a process for each server and start writing immediately
 spawn_workers(Connections, Self, Value, NumKeys) ->
@@ -127,9 +153,10 @@ spawn_workers(Connections, Self, Value, NumKeys) ->
 %% @doc open a tcp socket for each server
 open_conn(Servers) ->
     {ok, [begin
-              {ok, Sock} = gen_tcp:connect(Host, IP, ?TCP_OPTS),
-              {Host, IP, Sock}
-          end || {Host, IP} <- Servers]}.
+              log("Connecting to ~s:~p~n", [Host, Port]),
+              {ok, Sock} = gen_tcp:connect(Host, Port, ?TCP_OPTS),
+              {Host, Port, Sock}
+          end || {Host, Port} <- Servers]}.
 
 %% @doc close up sockets
 close_conn(Connections) ->
@@ -147,7 +174,7 @@ collect_stats(Sock, Acc) ->
     case gen_tcp:recv(Sock, 0) of
         {ok, <<"STAT ", Stat/binary>>} ->
             [Key, Val] = string:tokens(binary_to_list(Stat), " "),
-            TStat = {list_to_atom(Key), trim_whitespace(Val)},
+            TStat = {list_to_atom(Key), rm_trailing_rn(Val)},
             collect_stats(Sock, [TStat|Acc]);
         {ok, <<"END\r\n">>} ->
             Acc
@@ -165,9 +192,15 @@ stat([_Ignore | Rest], Acc) ->
     stat(Rest, Acc).
 
 
-%% @doc trims newlines etc
-trim_whitespace(Str) ->
-    re:replace(Str, "\\s+", "", [global, {return, list}]).
+%% @doc make errors readable
+format_err(Err) ->
+    rm_trailing_rn(binary_to_list(Err)).
+
+
+%% @doc trims trailing newlines
+rm_trailing_rn(Str) ->
+    "\n\r" ++ Rest = lists:reverse(Str),
+    lists:reverse(Rest).
 
 
 %% @doc prints the terminal escape characters to go back X lines
@@ -175,10 +208,9 @@ bash_back(X) ->
     log("\e[" ++ integer_to_list(X) ++ "A").
 
 
-%% @doc possibly the worse way to generate a binary value, works for now
+%% @doc any reason to generate different data?
 gen_bin(N) ->
     <<0:N/integer-unit:8>>.
-    %list_to_binary(lists:flatten(lists:duplicate(N, [$A])) ++ "\r\n").
 
 
 %% @doc Generate an incremental key (this may screw up system time?)
