@@ -34,6 +34,3 @@ Usage
 
         -s / --servers [hostname:memcachedport]
     The servers to write to eg: 127.0.0.1:12001,127.0.0.1:12003
-
-        -kg / --key-gen inc|rand
-    The type of key generation, inc = increment, rand = random.
