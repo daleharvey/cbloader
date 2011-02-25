@@ -21,8 +21,8 @@ Usage
 =====
 
     $ cbloader
-    $ cbloader -n 10k -p 1kb -s 127.0.0.1:12001 -kg rand
-    $ cbloader --num-keys 10k --payload-size 1kb --servers 127.0.0.1:120001 --key-gen rand
+    $ cbloader -n 10k -p 1kb -s 127.0.0.1:12001
+    $ cbloader --num-keys 10k --payload-size 1kb --servers 127.0.0.1:120001
 
 ### Arguments
 
