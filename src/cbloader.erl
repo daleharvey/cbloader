@@ -11,7 +11,7 @@ main(Args) ->
 
 %% @doc default command line parameters
 defaults() ->
-    "-n 10k -p 1kb -s 127.0.0.1:12001 -kg rand".
+    "-n 10k -p 1kb -s 127.0.0.1:12001".
 
 
 %% @doc Merge 2 proplists into each other, taking all the key from
@@ -33,15 +33,6 @@ merge([{Key, Def} | Rest], Opts, Acc) ->
 %% a proplist, exapand shorthand args
 parse([], Acc) ->
     Acc;
-
-%% @doc key_gen, the function used to generate keys, can be inc(incremental)
-%% or rand(random)
-parse(["-kg", KeyGen | Rest], Acc) ->
-    parse(["--key-gen", KeyGen | Rest], Acc);
-parse(["--key-gen", "inc" | Rest], Acc) ->
-    parse(Rest, [{key_gen, incremental} | Acc]);
-parse(["--key-gen", "rand" | Rest], Acc) ->
-    parse(Rest, [{key_gen, random} | Acc]);
 
 %% @doc num_keys, the number of keys to write to memcached
 parse(["-n", Keys | Rest], Acc) ->

@@ -14,17 +14,16 @@ dispatch(Conf) ->
     Servers = pget(servers, Conf),
     KeySize = pget(payload_size, Conf),
     NumKeys = pget(num_keys, Conf),
-    KeyGen  = pget(key_gen, Conf),
 
     log("Posting ~p keys of ~p bytes to each server:~n~n", [NumKeys, KeySize]),
-    {Time, ok} = timer:tc(fun start/5, [Self, Servers, KeySize, NumKeys, KeyGen]),
+    {Time, ok} = timer:tc(fun start/4, [Self, Servers, KeySize, NumKeys]),
     log("~nCompleted in ~.2f seconds~n", [Time/1000/1000]).
 
 
 %% @doc Spin off a thread for each tcp connection and start writing data
 %% immediately, start a timer for refreshing the ui and for collecting stats
--spec start(pid(), list(), integer(), integer(), atom()) -> ok.
-start(Self, Servers, KeySize, NumKeys, KeyGen) ->
+-spec start(pid(), list(), integer(), integer()) -> ok.
+start(Self, Servers, KeySize, NumKeys) ->
 
     Value = gen_bin(KeySize),
 
@@ -35,8 +34,9 @@ start(Self, Servers, KeySize, NumKeys, KeyGen) ->
     [{SHost, SIP}|_Rest] = Servers,
     {ok, SSock} = gen_tcp:connect(SHost, SIP, ?TCP_OPTS),
 
-    Workers = spawn_workers(Connections, Self, Value, NumKeys, KeyGen),
+    Workers = spawn_workers(Connections, Self, Value, NumKeys),
     Dict = dict:from_list([{Sock, {Host, IP, 0}} || {Host, IP, Sock} <- Workers]),
+
     wait(Dict, NumKeys, fetch_stats(SSock), SSock, length(Servers)),
 
     {ok, cancel} = timer:cancel(StatsTimer),
@@ -103,23 +103,24 @@ output(Workers, Total, Stats, LastLine) ->
 
 %% @doc Write values to memcache in a busy loop, will need to configure with
 %% pauses etc at some point, notify Main process when complete
-cb_write(_Socks, Main, _Val, 0, _KeyGen) ->
+cb_write(_Socks, Main, _Val, 0) ->
     Main ! {complete, self()},
     ok;
 
-cb_write(Sock, Self, Val, N, KeyGen) ->
-    Key = gen_key(KeyGen, N),
-    Cmd = fmt("set ~s ~p 0 ~p\r\n", [Key, 0, length(Val)]),
-    ok = gen_tcp:send(Sock, Cmd),
-    ok = gen_tcp:send(Sock, fmt("~s\r\n", [Val])),
-    {ok, _Data} = gen_tcp:recv(Sock, 0),
+cb_write(Sock, Self, Val, N) ->
+    %Cmd = fmt("set ~s ~p 0 ~p\r\n", [gen_key(), byte_size(Val) ]),
+    ok = gen_tcp:send(Sock, cmd(gen_key(), byte_size(Val))),
+    ok = gen_tcp:send(Sock, [Val, <<"\r\n">>]),
+    {ok, <<"STORED\r\n">>} = gen_tcp:recv(Sock, 0, 500),
     Self ! {left, self(), N},
-    cb_write(Sock, Self, Val, N-1, KeyGen).
+    cb_write(Sock, Self, Val, N-1).
 
 
 %% @doc spawn a process for each server and start writing immediately
-spawn_workers(Connections, Self, Value, NumKeys, KeyGen) ->
-    [{Host, IP, spawn(fun() -> cb_write(Sock, Self, Value, NumKeys, KeyGen) end)}
+spawn_workers(Connections, Self, Value, NumKeys) ->
+    [{Host, IP, spawn_link(fun() ->
+                                   cb_write(Sock, Self, Value, NumKeys)
+                           end)}
       || {Host, IP, Sock} <- Connections ].
 
 
@@ -176,14 +177,19 @@ bash_back(X) ->
 
 %% @doc possibly the worse way to generate a binary value, works for now
 gen_bin(N) ->
-    lists:flatten(lists:duplicate(N, [$A])).
+    <<0:N/integer-unit:8>>.
+    %list_to_binary(lists:flatten(lists:duplicate(N, [$A])) ++ "\r\n").
 
 
-gen_key(incremental, N) ->
-    "test-" ++ i2l(N);
+%% @doc Generate an incremental key (this may screw up system time?)
+gen_key() ->
+    {Mega, Sec, Micro} = erlang:now(),
+    i2l((Mega * 1000000 + Sec) * 1000000 + Micro).
 
-gen_key(random, _N) ->
-    [random:uniform(90) + $\s + 1 || _ <- lists:seq(1, 36)].
+
+%% @doc Create a set command to write to memcached
+cmd(Key, Size) ->
+    ["set ", Key, " 0 0 ", i2l(Size), "\r\n"].
 
 
 %% Just a bunch of shorthand functions
