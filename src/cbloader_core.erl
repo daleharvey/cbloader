@@ -6,7 +6,7 @@
 -define(STATS_UPDATE, 500).
 
 -define(TCP_TIMEOUT, 5000).
--define(TCP_OPTS, [binary, {packet, line}, {active, false}]).
+-define(TCP_OPTS, [binary, {packet, line}]).
 
 %% Main entry point
 -spec dispatch(list()) -> ok.
@@ -17,6 +17,7 @@ dispatch(Conf) ->
     Servers = pget(servers, Conf),
     KeySize = pget(payload_size, Conf),
     NumKeys = pget(num_keys, Conf),
+
     {Time, ok} = timer:tc(fun start/4, [Self, Servers, KeySize, NumKeys]),
     log("~n\e[32mCompleted in ~.2f seconds\e[0m~n", [Time/1000/1000]).
 
@@ -41,41 +42,73 @@ start(Self, Servers, KeySize, NumKeys) ->
     Workers = spawn_workers(Connections, Self, Value, NumKeys),
     Dict = dict:from_list([{Sock, {Host, IP, 0}} || {Host, IP, Sock} <- Workers]),
 
-    wait(Dict, NumKeys, fetch_stats(SSock), SSock, length(Servers), dict:new()),
+    wait(Dict, NumKeys, dict:new(), SSock, length(Servers), dict:new()),
 
     {ok, cancel} = timer:cancel(StatsTimer),
     {ok, cancel} = timer:cancel(DisplayTimer),
+
     ok = close_conn(Connections).
 
 
 %% @doc Part of the main process, sits and waits for the other processes to
 %% finish writing to memcache, fetches stats and updates ui in the meanwhile,
-%% bit messy
+%% bit messy, rewrite to gen_server
 wait(Workers, Total, Stats, Sock, NumServers, Errs) ->
+    wait(Workers, Total, Stats, Sock, NumServers, Errs, 0, NumServers * Total).
+
+wait(Workers, Total, Stats, Sock, NumServers, Errs, C, X) ->
     receive
         stats ->
-            NStats = fetch_stats(Sock),
-            wait(Workers, Total, NStats, Sock, NumServers, Errs);
+            ok = fetch_stats(Sock),
+            wait(Workers, Total, Stats, Sock, NumServers, Errs, C, X);
         print ->
             output(Workers, Total, Stats, Errs, false),
-            wait(Workers, Total, Stats, Sock, NumServers, Errs);
+            wait(Workers, Total, Stats, Sock, NumServers, Errs, C, X);
         {error, Err} ->
             NErrs = dict:update_counter(format_err(Err), 1, Errs),
-            wait(Workers, Total, Stats, Sock, NumServers, NErrs);
+            wait(Workers, Total, Stats, Sock, NumServers, NErrs, C, X);
         {left, Pid, N} ->
             Fun = fun({Host, IP, _}) -> {Host, IP, N} end,
             NDict = dict:update(Pid, Fun, Workers),
-            wait(NDict, Total, Stats, Sock, NumServers, Errs);
+            wait(NDict, Total, Stats, Sock, NumServers, Errs, C, X);
         {complete, _Pid} ->
             % Let my message queue flush
             case NumServers =:= 1 of
                 true -> self() ! done;
                 _    -> ok
             end,
-            wait(Workers, Total, Stats, Sock, NumServers - 1, Errs);
+            wait(Workers, Total, Stats, Sock, NumServers-1, Errs, C, X);
+
+        {tcp, _Port, <<"STORED\r\n">>} ->
+            NStats = dict:update_counter(responses, 1, Stats),
+            wait(Workers, Total, NStats, Sock, NumServers, Errs, C+1, X);
+        {tcp, _Port, <<"STAT ", Rest/binary>>} ->
+            [Key, Val] = string:tokens(binary_to_list(Rest), " "),
+            NStats = dict:store(list_to_atom(Key), rm_trailing_rn(Val), Stats),
+            wait(Workers, Total, NStats, Sock, NumServers, Errs, C, X);
+        {tcp, _Port, <<"END\r\n">>} ->
+            wait(Workers, Total, Stats, Sock, NumServers, Errs, C+1, X);
+        {tcp, _Port, Err} ->
+            NErrs = dict:update_counter(format_err(Err), 1, Errs),
+            wait(Workers, Total, Stats, Sock, NumServers, NErrs, C+1, X);
+
         done ->
-            output(Workers, Total, Stats, Errs, true)
+            Test = wait_for_x(X - C, []),
+            NStats = dict:update_counter(responses, length(Test), Stats),
+            output(Workers, Total, NStats, Errs, true),
+            ok
+        end.
+
+
+%% @docs Wait for X number of messages to be sent and return them
+wait_for_x(0, Acc) ->
+    Acc;
+wait_for_x(X, Acc) ->
+    receive
+        Msg ->
+            recieveN(X - 1, [Msg | Acc])
     end.
+
 
 %% @doc format the currest status of individual server writes
 write_status(Total, Left, Host, IP) ->
@@ -95,7 +128,7 @@ pbar(Perc) ->
 %% @doc Displays the current status in the shell
 output(Workers, Total, Stats, Errs, LastLine) ->
 
-    ErrOut = [ fmt("  \e[31m~s(~p)\e[0m~n", [ErrLabel, Count])
+    ErrOut = [ fmt("\e[2K  \e[31m~s(~p)\e[0m~n", [ErrLabel, Count])
                || {ErrLabel, Count} <- dict:to_list(Errs) ],
 
     Work = [ write_status(Total, Left, Host, IP)
@@ -103,18 +136,27 @@ output(Workers, Total, Stats, Errs, LastLine) ->
 
     NErrors = case ErrOut of
                   [] -> [];
-                  _ -> [fmt("Errors:~n", []) | ErrOut]
+                  _ -> ["\e[2K\r\n", fmt("\e[2KErrors:~n", []) | ErrOut]
               end,
 
-    StatOut = stat(Stats, []),
-    BackLog = length(NErrors) + length(Work) + length(StatOut) + 1,
+    StatOut = dict:fold(fun format_stats/3, [fmt("\e[2KStatistics: ~n", []),
+                                             "\e[2K\r\n"], Stats),
+    BackLog = length(NErrors) + length(Work) + length(StatOut),
 
-    log([Work, StatOut, NErrors]),
-
+    log([Work, lists:reverse(StatOut), NErrors]),
     % Set the cursor back to where I started writing
     % to do in place updates (unless its the last line)
     not LastLine andalso
         bash_back(BackLog).
+
+
+%% Pick out some stats we want and format them, ignore the rest
+format_stats(responses, Resp, Acc) ->
+    [fmt("\e[2K  Responces: ~p~n", [Resp]) | Acc];
+format_stats(bytes_written, Resp, Acc) ->
+    [fmt("\e[2K  Bytes Written: ~s~n", [Resp]) | Acc];
+format_stats(Key, Val, Acc) ->
+    Acc.
 
 
 %% @doc Write values to memcache in a busy loop, will need to configure with
@@ -126,10 +168,6 @@ cb_write(_Socks, Main, _Val, 0) ->
 cb_write(Sock, Main, Val, N) ->
     ok = gen_tcp:send(Sock, cmd(gen_key(), byte_size(Val))),
     ok = gen_tcp:send(Sock, [Val, <<"\r\n">>]),
-    % Need to change to passive mode pretty quickly, hard to tell the difference
-    % between timeouts and sending memcached the wrong Content-Length
-    {ok, Data} = gen_tcp:recv(Sock, 0, ?TCP_TIMEOUT),
-    ok = report_errors(Data, Main),
     Main ! {left, self(), N},
     cb_write(Sock, Main, Val, N-1).
 
@@ -166,8 +204,8 @@ close_conn(Connections) ->
 
 %% Fetch the stats via the memcached bucket
 fetch_stats(Sock) ->
-    ok = gen_tcp:send(Sock, fmt("stats\r\n", [])),
-    collect_stats(Sock, []).
+    ok = gen_tcp:send(Sock, fmt("stats\r\n", [])).
+    %collect_stats(Sock, []).
 
 %% @doc Make sure to collect till END of stats, the format into proplist
 collect_stats(Sock, Acc) ->
