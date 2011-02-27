@@ -160,18 +160,19 @@ handle_info({tcp, _, Err}, #state{
                }};
 
 handle_info(done, #state{
-              stats=Stats,
-              num_keys=NumKeys,
-              servers=Servers,
-              workers=Workers,
-              errors=Errors,
-              recieved=C,
+              processes = Processes,
+              stats = Stats,
+              num_keys = NumKeys,
+              servers = Servers,
+              workers = Workers,
+              errors = Errors,
+              recieved = C,
               parent = Parent
              } = State) ->
 
     Test = wait_for_x((length(Servers) * NumKeys) - C, []),
     NStats = dict:update_counter(responses, length(Test), Stats),
-    output(Workers, NumKeys, NStats, Errors, true),
+    output(Workers, erlang:trunc(NumKeys / Processes), NStats, Errors, true),
     Parent ! finished,
     {noreply, State};
 
@@ -269,8 +270,10 @@ output(Workers, Total, Stats, Errs, LastLine) ->
 
 
 %% Pick out some stats we want and format them, ignore the rest
+format_stats(total_items, Resp, Acc) ->
+    [fmt("\e[2K  Total Items: ~s~n", [Resp]) | Acc];
 format_stats(responses, Resp, Acc) ->
-    [fmt("\e[2K  Responces: ~p~n", [Resp]) | Acc];
+    [fmt("\e[2K  Responses: ~p~n", [Resp]) | Acc];
 format_stats(bytes_written, Resp, Acc) ->
     [fmt("\e[2K  Bytes Written: ~s~n", [Resp]) | Acc];
 format_stats(_Key, _Val, Acc) ->
@@ -346,7 +349,7 @@ gen_bin(N) ->
 %% @doc Generate an incremental key (this may screw up system time?)
 gen_key() ->
     {Mega, Sec, Micro} = erlang:now(),
-    i2l((Mega * 1000000 + Sec) * 1000000 + Micro).
+    pid_to_list(self()) ++ i2l((Mega * 1000000 + Sec) * 1000000 + Micro).
 
 
 %% @doc Create a set command to write to memcached
