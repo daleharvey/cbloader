@@ -31,7 +31,8 @@
           recieved = 0
          }).
 
--export([start_link/0, stop/0, setup/4, start/0]).
+
+-export([start_link/0, stop/0, setup/3, start/0]).
 
 %% ------------------------------------------------------------------
 %% API Function Definitions
@@ -40,8 +41,8 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
-setup(Parent, Servers, KeySize, NumKeys) ->
-    gen_server:call(?MODULE, {set_data, Parent, Servers, KeySize, NumKeys}).
+setup(Servers, KeySize, NumKeys) ->
+    gen_server:call(?MODULE, {set_data, Servers, KeySize, NumKeys}).
 
 start() ->
     gen_server:call(?MODULE, start).
@@ -57,9 +58,13 @@ init([]) ->
     {ok, #state{}}.
 
 
-handle_call({set_data, Parent, Servers, KeySize, NumKeys}, _From, _State) ->
-    {reply, ok, #state{parent=Parent, servers=Servers,
-                       key_size=KeySize, num_keys=NumKeys}};
+handle_call({set_data, Servers, KeySize, NumKeys}, {Pid, _Ref}, _State) ->
+    {reply, ok, #state{
+              parent = Pid,
+              servers = Servers,
+              key_size = KeySize,
+              num_keys = NumKeys
+             }};
 
 handle_call(start, _From, State) ->
     {reply, ok, do_start(State)};
@@ -68,8 +73,11 @@ handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
 
-handle_cast(stop, #state{stats_timer=StatsTimer, display_timer=DisplayTimer,
-                         connections=Connections} = State) ->
+handle_cast(stop, #state{
+              stats_timer = StatsTimer,
+              display_timer = DisplayTimer,
+              connections = Connections
+             } = State) ->
 
     {ok, cancel} = timer:cancel(StatsTimer),
     {ok, cancel} = timer:cancel(DisplayTimer),
@@ -82,12 +90,17 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 
-handle_info(print, #state{workers=Workers, num_keys=Total,
-                          stats=Stats, errors=Errs} = State) ->
+handle_info(print, #state{
+              workers = Workers,
+              num_keys = Total,
+              stats = Stats,
+              errors = Errs
+             } = State) ->
+
     output(Workers, Total, Stats, Errs, false),
     {noreply, State};
 
-handle_info(stats, #state{stats_socket=Sock} = State) ->
+handle_info(stats, #state{stats_socket = Sock} = State) ->
     ok = fetch_stats(Sock),
     {noreply, State};
 
@@ -95,39 +108,63 @@ handle_info({error, Err}, #state{errors = Errs} = State) ->
     NErrs = dict:update_counter(format_err(Err), 1, Errs),
     {noreply, State#state{errors = NErrs}};
 
-handle_info({left, Pid, N}, #state{workers=Workers} = State) ->
-    NDict = dict:update(Pid, fun({Host, IP, _}) -> {Host, IP, N} end, Workers),
-    {noreply, State#state{workers = NDict}};
+handle_info({left, Pid, N}, #state{workers = Workers} = State) ->
+    Fun = fun({Host, IP, _}) -> {Host, IP, N} end,
+    {noreply, State#state{
+                workers = dict:update(Pid, Fun, Workers)
+               }};
 
-handle_info({complete, _Pid}, #state{servers=Servers,
-                                            completed=Completed} = State) ->
+handle_info({complete, _Pid}, #state{
+              servers = Servers,
+              completed = Completed
+             } = State) ->
+
     case Completed + 1 =:= length(Servers) of
         true -> self() ! done;
         _    -> ok
     end,
     {noreply, State#state{completed = Completed + 1}};
 
-handle_info({tcp, _, <<"STORED\r\n">>}, #state{recieved=Recv,
-                                               stats=Stats} = State) ->
-    {noreply, State#state{recieved=Recv + 1,
-                            stats = dict:update_counter(responses, 1, Stats)}};
+handle_info({tcp, _, <<"STORED\r\n">>}, #state{
+              recieved = Recv,
+              stats = Stats
+             } = State) ->
+
+    {noreply, State#state{
+                recieved = Recv + 1,
+                stats = dict:update_counter(responses, 1, Stats)
+               }};
 
 handle_info({tcp, _, <<"STAT ", Rest/binary>>}, #state{stats=Stats} = State) ->
     [Key, Val] = string:tokens(binary_to_list(Rest), " "),
-    NStats = dict:store(list_to_atom(Key), rm_trailing_rn(Val), Stats),
-    {noreply, State#state{stats=NStats}};
+    {noreply, State#state{
+                stats = dict:store(list_to_atom(Key), rm_trailing_rn(Val), Stats)
+               }};
 
 
 handle_info({tcp, _Port, <<"END\r\n">>}, State) ->
     {noreply, State};
 
-handle_info({tcp, _, Err}, #state{recieved=Recv, errors=Errors} = State) ->
-    NErrs = dict:update_counter(format_err(Err), 1, Errors),
-    {noreply, State#state{recieved=Recv + 1, errors = NErrs}};
+handle_info({tcp, _, Err}, #state{
+              recieved=Recv,
+              errors=Errors
+             } = State) ->
 
-handle_info(done, #state{stats=Stats, num_keys=NumKeys, servers=Servers,
-                         workers=Workers, errors=Errors, recieved=C,
-                         parent = Parent} = State) ->
+    {noreply, State#state{
+                recieved = Recv + 1,
+                errors = dict:update_counter(format_err(Err), 1, Errors)
+               }};
+
+handle_info(done, #state{
+              stats=Stats,
+              num_keys=NumKeys,
+              servers=Servers,
+              workers=Workers,
+              errors=Errors,
+              recieved=C,
+              parent = Parent
+             } = State) ->
+
     Test = wait_for_x((length(Servers) * NumKeys) - C, []),
     NStats = dict:update_counter(responses, length(Test), Stats),
     output(Workers, NumKeys, NStats, Errors, true),
@@ -271,17 +308,6 @@ close_conn(Connections) ->
 %% Fetch the stats via the memcached bucket
 fetch_stats(Sock) ->
     ok = gen_tcp:send(Sock, fmt("stats\r\n", [])).
-
-
-%% @doc filter and format the list of stats
-stat([], Acc) ->
-    [fmt("~nStatistics: ~n", []) | Acc];
-
-stat([{bytes_written, Bytes} | Rest], _Acc) ->
-    stat(Rest, [fmt("  Bytes Written: ~s~n", [Bytes])]);
-
-stat([_Ignore | Rest], Acc) ->
-    stat(Rest, Acc).
 
 
 %% @doc make errors readable
