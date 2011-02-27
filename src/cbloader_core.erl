@@ -6,11 +6,12 @@
 dispatch(Conf) ->
 
     Servers = proplists:get_value(servers, Conf),
-    KeySize = proplists:get_value(payload_size, Conf),
+    KeySize = proplists:get_value(value_size, Conf),
     NumKeys = proplists:get_value(num_keys, Conf),
+    Processes = proplists:get_value(processes, Conf),
 
     cbloader_srv:start_link(),
-    cbloader_srv:setup(Servers, KeySize, NumKeys),
+    cbloader_srv:setup(Servers, KeySize, NumKeys, Processes),
 
     T1 = now(),
 

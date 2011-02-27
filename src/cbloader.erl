@@ -11,7 +11,7 @@ main(Args) ->
 
 %% @doc default command line parameters
 defaults() ->
-    "-n 10k -p 1kb -s 127.0.0.1:12001".
+    "-n 10k -v 1kb -p 5 -s 127.0.0.1:12001".
 
 
 %% @doc Merge 2 proplists into each other, taking all the key from
@@ -34,6 +34,12 @@ merge([{Key, Def} | Rest], Opts, Acc) ->
 parse([], Acc) ->
     Acc;
 
+%% @doc processes, number of worker processes to spin off for each server
+parse(["-p", Keys | Rest], Acc) ->
+    parse(["--processes", Keys | Rest], Acc);
+parse(["--processes", Keys | Rest], Acc) ->
+    parse(Rest, [{processes, list_to_integer(Keys)} | Acc]);
+
 %% @doc num_keys, the number of keys to write to memcached
 parse(["-n", Keys | Rest], Acc) ->
     parse(["--num-keys", Keys | Rest], Acc);
@@ -41,10 +47,10 @@ parse(["--num-keys", Keys | Rest], Acc) ->
     parse(Rest, [{num_keys, to_num(Keys)} | Acc]);
 
 %% @doc payload_size, the size of the values to write to memcached
-parse(["-p", Size | Rest], Acc) ->
-    parse(["--payload-size", Size | Rest], Acc);
-parse(["--payload-size", Size | Rest], Acc) ->
-    parse(Rest, [{payload_size, to_bytes(Size)} | Acc]);
+parse(["-v", Size | Rest], Acc) ->
+    parse(["--value-size", Size | Rest], Acc);
+parse(["--value-size", Size | Rest], Acc) ->
+    parse(Rest, [{value_size, to_bytes(Size)} | Acc]);
 
 %% @doc servers, the list of servers to write to
 parse(["-s", Servers | Rest], Acc) ->

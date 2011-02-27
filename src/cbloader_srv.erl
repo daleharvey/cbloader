@@ -28,11 +28,12 @@
           stats_socket = null,
           completed = 0,
           errors = dict:new(),
-          recieved = 0
+          recieved = 0,
+          processes = 0
          }).
 
 
--export([start_link/0, stop/0, setup/3, start/0]).
+-export([start_link/0, stop/0, setup/4, start/0]).
 
 %% ------------------------------------------------------------------
 %% API Function Definitions
@@ -41,8 +42,8 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
-setup(Servers, KeySize, NumKeys) ->
-    gen_server:call(?MODULE, {set_data, Servers, KeySize, NumKeys}).
+setup(Servers, KeySize, NumKeys, Processes) ->
+    gen_server:call(?MODULE, {set_data, Servers, KeySize, NumKeys, Processes}).
 
 start() ->
     gen_server:call(?MODULE, start).
@@ -58,9 +59,10 @@ init([]) ->
     {ok, #state{}}.
 
 
-handle_call({set_data, Servers, KeySize, NumKeys}, {Pid, _Ref}, _State) ->
+handle_call({set_data, Servers, KeySize, NumKeys, Processes}, {Pid, _Ref}, _State) ->
     {reply, ok, #state{
               parent = Pid,
+              processes = Processes,
               servers = Servers,
               key_size = KeySize,
               num_keys = NumKeys
@@ -93,11 +95,12 @@ handle_cast(_Msg, State) ->
 handle_info(print, #state{
               workers = Workers,
               num_keys = Total,
+              processes = Processes,
               stats = Stats,
               errors = Errs
              } = State) ->
 
-    output(Workers, Total, Stats, Errs, false),
+    output(Workers, erlang:trunc(Total / Processes), Stats, Errs, false),
     {noreply, State};
 
 handle_info(stats, #state{stats_socket = Sock} = State) ->
@@ -115,11 +118,12 @@ handle_info({left, Pid, N}, #state{workers = Workers} = State) ->
                }};
 
 handle_info({complete, _Pid}, #state{
+              processes = Processes,
               servers = Servers,
               completed = Completed
              } = State) ->
 
-    case Completed + 1 =:= length(Servers) of
+    case Completed + 1 =:= length(Servers) * Processes of
         true -> self() ! done;
         _    -> ok
     end,
@@ -186,11 +190,14 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
 
-do_start(#state{servers=Servers, key_size=KeySize, num_keys=NumKeys} = State) ->
+do_start(#state{servers = Servers,
+                key_size = KeySize,
+                num_keys = NumKeys,
+                processes = Processes} = State) ->
 
     Value = gen_bin(KeySize),
 
-    {ok, Connections} = open_conn(Servers),
+    {ok, Connections} = open_conn(Servers, Processes),
 
     log("~nKeys: ~p ~nPacket Size: ~p~n~n", [NumKeys, KeySize]),
 
@@ -200,7 +207,7 @@ do_start(#state{servers=Servers, key_size=KeySize, num_keys=NumKeys} = State) ->
     [{SHost, SIP}|_Rest] = Servers,
     {ok, SSock} = gen_tcp:connect(SHost, SIP, ?TCP_OPTS),
 
-    Workers = spawn_workers(Connections, self(), Value, NumKeys),
+    Workers = spawn_workers(Connections, self(), Value, NumKeys, Processes),
     Dict = dict:from_list([{Sock, {Host, IP, 0}} || {Host, IP, Sock} <- Workers]),
 
     State#state{
@@ -284,20 +291,25 @@ cb_write(Sock, Main, Val, N) ->
 
 
 %% @doc spawn a process for each server and start writing immediately
-spawn_workers(Connections, Self, Value, NumKeys) ->
-    [{Host, IP, spawn_link(fun() ->
-                                   cb_write(Sock, Self, Value, NumKeys)
-                           end)}
-      || {Host, IP, Sock} <- Connections ].
+spawn_workers(_Connections, _Self, _Value, NumKeys, Processes)
+  when (NumKeys =< Processes orelse NumKeys rem Processes =/= 0) ->
+    exit(invalid_process_num);
+spawn_workers(Connections, Self, Value, NumKeys, Processes) ->
+    X = erlang:trunc(NumKeys / Processes),
+    [{Host, IP, spawn_link(fun() -> cb_write(Sock, Self, Value, X) end)}
+     || {Host, IP, Sock} <- Connections ].
 
 
 %% @doc open a tcp socket for each server
-open_conn(Servers) ->
-    {ok, [begin
-              log("Connecting to ~s:~p~n", [Host, Port]),
-              {ok, Sock} = gen_tcp:connect(Host, Port, ?TCP_OPTS),
-              {Host, Port, Sock}
-          end || {Host, Port} <- Servers]}.
+open_conn(Servers, Processes) ->
+    Socks = [begin
+                 log("Connecting to ~s:~p~n", [Host, Port]),
+                 [begin
+                      {ok, Sock} = gen_tcp:connect(Host, Port, ?TCP_OPTS),
+                   {Host, Port, Sock}
+                  end || _ <- lists:seq(1, Processes)]
+             end || {Host, Port} <- Servers],
+    {ok, lists:flatten(Socks)}.
 
 %% @doc close up sockets
 close_conn(Connections) ->

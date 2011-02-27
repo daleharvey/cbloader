@@ -21,16 +21,20 @@ Usage
 =====
 
     $ cbloader
-    $ cbloader -n 10k -p 1kb -s 127.0.0.1:12001
-    $ cbloader --num-keys 10k --payload-size 1kb --servers 127.0.0.1:12001
+    $ cbloader -n 10k -v 1kb -p 5 -s 127.0.0.1:12001
+    $ cbloader --num-keys 10k --processes 5 --payload-size 1kb --servers 127.0.0.1:12001
 
 ### Arguments
 
         -n / --num_keys X
     The number of keys to write to memcached eg: 1, 100, 50k, 3m
 
-        -p / --payload-size X
+        -v / --value-size X
     The size of values to write eg: 500, 5kb, 3mb
 
         -s / --servers [hostname:memcachedport]
     The servers to write to eg: 127.0.0.1:12001,127.0.0.1:12003
+
+        -p / --processes X
+    The number of processes that write to each server, must be larger than and
+    a divisor of num_keys
